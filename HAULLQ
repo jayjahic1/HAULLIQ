@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""
+HaulIQ Load Analyzer (MVP)
+---------------------------
+Takes the core numbers for a load and returns a HaulIQ Score,
+true rate, fuel cost, operating cost, estimated profit, and a
+TAKE / CONSIDER / PASS recommendation.
+
+This is the "one killer workflow" MVP: paste in load numbers,
+get a decision. Broker/Facility/Destination scoring can be
+layered on top of this later (see LoadScore = Profit + Broker +
+Facility + Destination in the original plan).
+"""
+
+from dataclasses import dataclass
+import sys
+
+
+@dataclass
+class LoadInput:
+    load_pay: float          # total pay for the load, $
+    loaded_miles: float      # miles while loaded
+    deadhead_miles: float    # empty miles to get to pickup
+    fuel_price: float        # $ per gallon
+    truck_mpg: float         # truck fuel economy
+    operating_cost_per_mile: float  # non-fuel cost/mile (maintenance, insurance, etc.)
+
+
+@dataclass
+class LoadResult:
+    score: int
+    true_rate: float
+    fuel_cost: float
+    operating_cost: float
+    estimated_profit: float
+    profit_per_mile: float
+    recommendation: str
+    deep_dive: str
+
+
+def analyze_load(data: LoadInput) -> LoadResult:
+    total_miles = data.loaded_miles + data.deadhead_miles
+    if total_miles <= 0:
+        raise ValueError("Total miles must be greater than zero.")
+
+    # True rate accounts for deadhead, not just loaded miles.
+    true_rate = data.load_pay / total_miles
+
+    fuel_cost = (total_miles / data.truck_mpg) * data.fuel_price
+    operating_cost = total_miles * data.operating_cost_per_mile
+    estimated_profit = data.load_pay - fuel_cost - operating_cost
+    profit_per_mile = estimated_profit / total_miles
+    deadhead_pct = data.deadhead_miles / total_miles
+    fuel_cost_ratio = fuel_cost / data.load_pay if data.load_pay > 0 else 1.0
+
+    # --- Scoring: 5 factors, 100 points total ---
+    # 1. Rate score (0-25): revenue per mile, $1.50/mi (0) to $4.00/mi (25)
+    rate_score = _scale(true_rate, low=1.50, high=4.00, max_points=25)
+
+    # 2. Profit score (0-25): total $ left over, $0 (0) to $2000 (25)
+    profit_score = _scale(estimated_profit, low=0, high=2000, max_points=25)
+
+    # 3. Profit-per-mile score (0-25): separates "$1,500 over 500mi" from
+    #    "$1,500 over 1,500mi" — same total profit, very different trip.
+    #    $0/mi (0) to $1.50/mi (25)
+    profit_per_mile_score = _scale(profit_per_mile, low=0.0, high=1.50, max_points=25)
+
+    # 4. Deadhead score (0-15): reward low deadhead %, penalize high.
+    #    100% loaded (15) down to 50% deadhead (0)
+    deadhead_score = _scale(1 - deadhead_pct, low=0.5, high=1.0, max_points=15)
+
+    # 5. Fuel efficiency score (0-10): how much of the load pay fuel eats up.
+    #    10% of pay spent on fuel (10) down to 40% of pay spent on fuel (0)
+    fuel_score = _scale(1 - fuel_cost_ratio, low=0.60, high=0.90, max_points=10)
+
+    score = round(
+        rate_score + profit_score + profit_per_mile_score + deadhead_score + fuel_score
+    )
+    score = max(0, min(100, score))
+
+    if score >= 75:
+        recommendation = "TAKE"
+    elif score >= 50:
+        recommendation = "CONSIDER"
+    else:
+        recommendation = "PASS"
+
+    deep_dive = _build_deep_dive(
+        true_rate=true_rate,
+        estimated_profit=estimated_profit,
+        profit_per_mile=profit_per_mile,
+        deadhead_pct=deadhead_pct,
+        fuel_cost_ratio=fuel_cost_ratio,
+        rate_score=rate_score,
+        profit_score=profit_score,
+        profit_per_mile_score=profit_per_mile_score,
+        deadhead_score=deadhead_score,
+        fuel_score=fuel_score,
+        score=score,
+        recommendation=recommendation,
+    )
+
+    return LoadResult(
+        score=score,
+        true_rate=round(true_rate, 2),
+        fuel_cost=round(fuel_cost, 2),
+        operating_cost=round(operating_cost, 2),
+        estimated_profit=round(estimated_profit, 2),
+        profit_per_mile=round(profit_per_mile, 2),
+        recommendation=recommendation,
+        deep_dive=deep_dive,
+    )
+
+
+def _build_deep_dive(
+    true_rate: float,
+    estimated_profit: float,
+    profit_per_mile: float,
+    deadhead_pct: float,
+    fuel_cost_ratio: float,
+    rate_score: float,
+    profit_score: float,
+    profit_per_mile_score: float,
+    deadhead_score: float,
+    fuel_score: float,
+    score: int,
+    recommendation: str,
+) -> str:
+    """
+    Turn the score components into plain-language reasoning a driver
+    can actually act on, instead of a bare TAKE/CONSIDER/PASS label.
+    """
+    lines = []
+
+    # --- Rate commentary (revenue per mile) ---
+    if rate_score >= 20:          # top 80% of the 25-pt rate band
+        lines.append(
+            f"Rate: ${true_rate:.2f}/mile is a strong rate — comfortably "
+            f"above typical breakeven territory."
+        )
+    elif rate_score >= 11:
+        lines.append(
+            f"Rate: ${true_rate:.2f}/mile is middle-of-the-road. It'll cover "
+            f"costs and pay something, but it's not a rate that moves the needle."
+        )
+    else:
+        lines.append(
+            f"Rate: ${true_rate:.2f}/mile is weak — close to just covering "
+            f"costs rather than actually earning on the miles."
+        )
+
+    # --- Profit commentary (total $) ---
+    if estimated_profit < 0:
+        lines.append(
+            f"Profit: this load LOSES ${abs(estimated_profit):,.0f} once fuel "
+            f"and operating cost are covered. You'd be paying to run it."
+        )
+    elif profit_score >= 18:
+        lines.append(
+            f"Profit: ${estimated_profit:,.0f} estimated contribution is a "
+            f"solid payday for the trip."
+        )
+    elif profit_score >= 9:
+        lines.append(
+            f"Profit: ${estimated_profit:,.0f} estimated contribution is "
+            f"okay, not exciting. Fine if it sets up a better next load."
+        )
+    else:
+        lines.append(
+            f"Profit: ${estimated_profit:,.0f} estimated contribution is "
+            f"thin — barely worth the truck's time."
+        )
+
+    # --- Profit-per-mile commentary (efficiency of the trip itself) ---
+    if profit_per_mile < 0:
+        lines.append(
+            f"Profit/mile: -${abs(profit_per_mile):.2f}/mile. Every mile "
+            f"driven on this load actively costs you money."
+        )
+    elif profit_per_mile_score >= 18:
+        lines.append(
+            f"Profit/mile: ${profit_per_mile:.2f}/mile is excellent — this "
+            f"trip earns fast, not just a lot. Short and lucrative beats "
+            f"long and merely lucrative."
+        )
+    elif profit_per_mile_score >= 9:
+        lines.append(
+            f"Profit/mile: ${profit_per_mile:.2f}/mile is decent — solid "
+            f"money, but it takes a while (miles) to bank it."
+        )
+    else:
+        lines.append(
+            f"Profit/mile: ${profit_per_mile:.2f}/mile is low — the total "
+            f"profit number may look fine, but it's stretched over a lot "
+            f"of miles and truck time to get there."
+        )
+
+    # --- Deadhead commentary ---
+    deadhead_display = deadhead_pct * 100
+    if deadhead_score >= 12:
+        lines.append(
+            f"Deadhead: only {deadhead_display:.0f}% of the trip is empty "
+            f"miles — efficient use of the truck."
+        )
+    elif deadhead_score >= 6:
+        lines.append(
+            f"Deadhead: {deadhead_display:.0f}% of the trip is empty miles. "
+            f"Noticeable, but not a dealbreaker on its own."
+        )
+    else:
+        lines.append(
+            f"Deadhead: {deadhead_display:.0f}% of the trip is empty miles — "
+            f"a real drag on the true rate, even if the posted rate looked fine."
+        )
+
+    # --- Fuel efficiency commentary ---
+    fuel_pct_display = fuel_cost_ratio * 100
+    if fuel_score >= 8:
+        lines.append(
+            f"Fuel: fuel eats only {fuel_pct_display:.0f}% of the load pay — "
+            f"the economics here aren't fuel-sensitive."
+        )
+    elif fuel_score >= 4:
+        lines.append(
+            f"Fuel: fuel eats {fuel_pct_display:.0f}% of the load pay — a "
+            f"meaningful chunk. A fuel price jump would hurt this one."
+        )
+    else:
+        lines.append(
+            f"Fuel: fuel eats {fuel_pct_display:.0f}% of the load pay — this "
+            f"load is fragile to fuel prices and MPG. Small changes there "
+            f"could flip it into a loss."
+        )
+
+    # --- Bottom-line verdict ---
+    factors = [
+        ("rate", rate_score, 25),
+        ("total profit", profit_score, 25),
+        ("profit per mile", profit_per_mile_score, 25),
+        ("deadhead efficiency", deadhead_score, 15),
+        ("fuel efficiency", fuel_score, 10),
+    ]
+    weakest = min(factors, key=lambda x: x[1] / x[2])[0]
+
+    if recommendation == "TAKE":
+        lines.append(
+            f"Bottom line ({score}/100): rate, profit, and mileage economics "
+            f"are all pulling in the same direction. Take it."
+        )
+    elif recommendation == "CONSIDER":
+        lines.append(
+            f"Bottom line ({score}/100): this load is borderline — no single "
+            f"factor is disqualifying, but {weakest} is the piece dragging it "
+            f"down. Take it if it sets up a strong next load, gets you home "
+            f"on schedule, or you don't have a better option on the board. "
+            f"Pass if you can find something with a clearly higher score in "
+            f"the same lane."
+        )
+    else:  # PASS
+        lines.append(
+            f"Bottom line ({score}/100): the math doesn't work, mainly on "
+            f"{weakest}. Only take this if you're stuck with no better "
+            f"option to reposition the truck."
+        )
+
+    return "\n".join(lines)
+
+
+
+def _scale(value: float, low: float, high: float, max_points: float) -> float:
+    """Linearly scale value between low/high into 0..max_points, clamped."""
+    if high == low:
+        return max_points
+    pct = (value - low) / (high - low)
+    pct = max(0.0, min(1.0, pct))
+    return pct * max_points
+
+
+def _prompt_float(label: str) -> float:
+    while True:
+        raw = input(f"{label}: $" if "Price" in label or "Pay" in label else f"{label}: ")
+        try:
+            return float(raw)
+        except ValueError:
+            print("  Please enter a number.")
+
+
+def run_cli():
+    print("=" * 40)
+    print("       HAULIQ LOAD ANALYZER")
+    print("=" * 40)
+
+    load_pay = _prompt_float("Load Pay")
+    loaded_miles = _prompt_float("Loaded Miles")
+    deadhead_miles = _prompt_float("Deadhead Miles")
+    fuel_price = _prompt_float("Fuel Price")
+    truck_mpg = _prompt_float("Truck MPG")
+    operating_cost_per_mile = _prompt_float("Operating Cost/Mile")
+
+    data = LoadInput(
+        load_pay=load_pay,
+        loaded_miles=loaded_miles,
+        deadhead_miles=deadhead_miles,
+        fuel_price=fuel_price,
+        truck_mpg=truck_mpg,
+        operating_cost_per_mile=operating_cost_per_mile,
+    )
+
+    result = analyze_load(data)
+
+    print()
+    print(f"HAULIQ SCORE: {result.score}/100")
+    print()
+    print(f"True Rate:        ${result.true_rate}/mile")
+    print(f"Fuel Cost:        ${result.fuel_cost}")
+    print(f"Operating Cost:   ${result.operating_cost}")
+    print(f"Estimated Profit: ${result.estimated_profit}")
+    print(f"Profit/Mile:      ${result.profit_per_mile}")
+    print()
+    print(f"RECOMMENDATION: {result.recommendation}")
+    print()
+    print("-" * 40)
+    print("WHY:")
+    print(result.deep_dive)
+
+
+def run_stress_test():
+    """
+    Runs 10 hand-crafted loads spanning the realistic spectrum (amazing to
+    money-losing) through analyze_load() and prints a summary table, so
+    you can eyeball whether the score actually tracks reality.
+
+    Usage: python3 haulIQ_load_analyzer.py test
+    """
+    # (label, load_pay, loaded_miles, deadhead_miles, fuel_price, mpg, op_cost_per_mile)
+    test_loads = [
+        ("1. Amazing load",            3400, 700,  15, 3.60, 7.0, 0.28),
+        ("2. Good load",                2600, 650,  40, 3.75, 6.8, 0.32),
+        ("3. Average load",             1900, 600,  75, 3.85, 6.5, 0.35),
+        ("4. Barely profitable",        1150, 600, 100, 3.90, 6.2, 0.38),
+        ("5. Bad load",                  750, 550, 150, 4.00, 6.0, 0.40),
+        ("6. Money-losing load",         450, 600, 350, 4.20, 6.0, 0.55),
+        ("7. High deadhead load",       2200, 400, 400, 3.80, 6.5, 0.35),
+        ("8. Low deadhead load",        2200, 780,  10, 3.80, 6.5, 0.35),
+        ("9. Long-distance load",       3600, 1900, 50, 3.70, 7.2, 0.30),
+        ("10. Short/high-paying load",   950, 180,  20, 3.70, 6.8, 0.30),
+    ]
+
+    print(f"{'Load':<26} {'Score':>6} {'Rec':<10} {'Rate':>7} {'Profit':>9} {'$/mi':>7} {'DH%':>6}")
+    print("-" * 78)
+
+    results = []
+    for label, pay, loaded, dh, fuel_price, mpg, op_cost in test_loads:
+        data = LoadInput(
+            load_pay=pay,
+            loaded_miles=loaded,
+            deadhead_miles=dh,
+            fuel_price=fuel_price,
+            truck_mpg=mpg,
+            operating_cost_per_mile=op_cost,
+        )
+        result = analyze_load(data)
+        dh_pct = dh / (loaded + dh) * 100
+        results.append((label, result))
+
+        print(
+            f"{label:<26} {result.score:>5}/100 {result.recommendation:<10} "
+            f"${result.true_rate:>5.2f} ${result.estimated_profit:>8,.0f} "
+            f"${result.profit_per_mile:>5.2f} {dh_pct:>5.0f}%"
+        )
+
+    print()
+    print("=" * 78)
+    print("FULL REASONING PER LOAD")
+    print("=" * 78)
+    for label, result in results:
+        print(f"\n--- {label} — {result.score}/100 — {result.recommendation} ---")
+        print(result.deep_dive)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
+        run_stress_test()
+    else:
+        run_cli()
